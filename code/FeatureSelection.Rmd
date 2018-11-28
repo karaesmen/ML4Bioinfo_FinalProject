@@ -1,0 +1,185 @@
+---
+title: "ML4Bioinfo Final Project"
+author: "Ezgi Karaesmen"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(matrixStats)
+# ezknit(file = "code/FeatureSelection.Rmd",
+#        wd="~/LSClab/ML4Bioinfo_FinalProject/", 
+#        out_dir="report", fig_dir="figures")
+```
+
+# Feature selection with TCGA BRCA Data
+
+### Load RNA-Seq TCGA data
+
+```{r, eval=FALSE}
+#library(tidyverse)
+library(matrixStats)
+source("code/00-paths.R")
+clean <- paths$clean
+load(file.path(clean, "mRNASeq/BRCA.Rda"))
+load(file.path(paths$clean, "Clinical/BRCA.Rda"))
+
+```
+
+```{r, echo=FALSE}
+load("data/BRCA.Rda")
+load("data/clinBRCA.Rda")
+```
+
+### Select relevant variants based on variance and mean
+
+```{r}
+gene_means <- rowMeans(lcounts)
+gene_std <- rowSds(lcounts)
+gene_var <- rowVars(lcounts)
+
+plot(gene_means, gene_std)
+
+
+smoothScatter(gene_means, gene_var, nrpoints=500, xlab="Mean", ylab="Standard Deviation")
+
+smoothScatter(gene_means, gene_std, nrpoints=500, xlab="Mean", ylab="Standard Deviation")
+lines(c(-1, 7, 7, 20), c(1.5, 1.5, 1,1), col="orange", lwd=3)
+
+ filt_genes <- (gene_means < 7 & gene_std > 1.5) | (gene_means > 7 & gene_std > 1)
+table(filt_genes)
+```
+
+We will move forward with **3213** genes for feature selection.
+
+### Determine case/control samples and clinical data
+
+```{r}
+ids <- tolower(substr(colnames(lcounts), 1, 12))
+samps <- substr(colnames(lcounts), 14, 16)
+table(samps)
+as.factor(ifelse(grepl("11", samps), "N", "T")) -> samps
+table(samps)
+```
+
+There are 7 metastatic, 1093 primary solid tumor and 112 control samples. Sanity check [here](https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/sample-type-codes) for sample codes. Also 3 samples are missing from clinical data.
+
+```{r, eval=FALSE, warning=FALSE, message=FALSE}
+id_df <- data.frame(ids,
+                    samps,
+                    tcga_ids=colnames(lcounts))
+head(id_df)
+
+id_T <- filter(id_df, samps == "T") 
+
+posfun <- function(x) {
+    case_when(x == "positive" ~ "+",
+              x == "negative" ~ "-")
+}
+
+clin %>%
+    rownames_to_column(var="ids") %>%
+    separate(menopause_status, c("M", "x"), sep="[ (]") %>%
+    select(ids,
+           M,
+           PR=breast_carcinoma_progesterone_receptor_status,
+           ER=breast_carcinoma_estrogen_receptor_status,
+           HER2=lab_proc_her2_neu_immunohistochemistry_receptor_status) %>%
+    mutate_at(vars(PR:HER2), posfun) %>%
+    drop_na() %>%
+    mutate(subtype = 
+               case_when(PR == "+" & ER == "+" & HER2 == "+" ~ "Basal",
+                         PR == "-" & ER == "-" & HER2 == "+" ~ "HER2",
+                         PR == "+" & ER == "+" & HER2 == "-" ~ "LuminalA",
+                         (PR == "+" | ER == "+") & HER2 == "+" ~ "LuminalB",
+                         )
+           ) %>% 
+    left_join(id_T) -> brca_clin
+
+head(brca_clin)
+table(brca_clin$subtype)
+
+
+# PR = paste0("PR", PR),
+#            ER = paste0("ER", ER),
+#            HER2 = paste0("HER2", HER2)
+# 
+head(brca_clin)
+nrow(brca_clin)
+
+table(brca_clin$subtype)
+
+id_uni <- filter(id_df, !tcga_ids %in% brca_clin$tcga_ids)
+head(id_uni)
+nrow(id_uni)
+table(id_uni$samps)
+```
+
+435 tumor and 112 normal samples will be used for univariate analyses of 3213 genes.
+Rest of the dataset, 667 tumor samples, will be used for feature selection with boruta. 
+
+Subtype definitions:
+
+ER and PR status are assessed using the consensus of clinical tests and summarized in “breast carcinoma estrogen receptor status” and “breast carcinoma progesterone receptor status”, respectively. HER2 status is obtained from IHC in the variable labeled “lab proc her2 neu immunohistochemistry receptor status.” Samples missing data for any one of these tests are excluded from analysis, leaving a total of 638 samples with RNA-sequencing data. 
+
+Breast cancer samples are defined as 
+- “Basal” if all three markers are negative, 
+- “HER2+” if only HER2 is positive, 
+- “Luminal A” if either ER or PR are positive but not HER2, and 
+- “Luminal B” if HER2 is positive in addition to either ER or PR. 
+
+
+```{r}
+rna_dat_uni <- lcounts[filt_genes, id_uni$tcga_ids]
+rna_dat_uni[1:5, 1:5]
+uni_test <- function(g){
+    glm(id_uni$samps ~ g,
+        family = "binomial") %>%
+        tidy() %>%
+        .[2,] 
+}
+
+rna_dat_list <- split(rna_dat_uni, rownames(rna_dat_uni))
+uni_res <- rna_dat_list  %>%
+    map_df(uni_test) %>%
+    mutate(genes=names(rna_dat_list))
+head(uni_res)
+
+hist(uni_res$p.value)
+
+uni_res %>%
+    filter(p.value < 0.05/nrow(.)) %>% nrow()
+
+uni_res %>%
+    filter(p.value < 0.05/nrow(.)) %>% .$genes -> subt_genes
+
+
+library(Boruta)
+Boruta(x = lcounts[filt_genes, id_uni$tcga_ids], y=samps,
+       maxRuns = 500,
+       mtry = 20,
+       ntree = 100,
+       doTrace = 2
+       )
+
+
+
+library(Boruta)
+
+irisE<-cbind(
+setNames(
+data.frame(apply(iris[,-5],2,sample)),
+sprintf("Nonsense%d",1:4) ),
+iris
+ )
+Boruta(Species~.,data=irisE)->BorutaOnIrisE
+BorutaOnIrisE
+save(BorutaOnIrisE, file="test.RData")
+load("test.RData")
+
+plot(BorutaOnIrisE)
+BorutaOnIrisE
+```
+
