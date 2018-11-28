@@ -16,6 +16,8 @@ library(matrixStats)
 
 # Feature selection with TCGA BRCA Data
 
+## Data Cleaning
+
 ### Load RNA-Seq TCGA data
 
 ```{r, eval=FALSE}
@@ -38,12 +40,6 @@ load("data/clinBRCA.Rda")
 ```{r}
 gene_means <- rowMeans(lcounts)
 gene_std <- rowSds(lcounts)
-gene_var <- rowVars(lcounts)
-
-plot(gene_means, gene_std)
-
-
-smoothScatter(gene_means, gene_var, nrpoints=500, xlab="Mean", ylab="Standard Deviation")
 
 smoothScatter(gene_means, gene_std, nrpoints=500, xlab="Mean", ylab="Standard Deviation")
 lines(c(-1, 7, 7, 20), c(1.5, 1.5, 1,1), col="orange", lwd=3)
@@ -81,35 +77,26 @@ posfun <- function(x) {
 
 clin %>%
     rownames_to_column(var="ids") %>%
-    separate(menopause_status, c("M", "x"), sep="[ (]") %>%
+    # separate(menopause_status, c("M", "x"), sep="[ (]") %>%
     select(ids,
-           M,
+           # M,
            PR=breast_carcinoma_progesterone_receptor_status,
            ER=breast_carcinoma_estrogen_receptor_status,
            HER2=lab_proc_her2_neu_immunohistochemistry_receptor_status) %>%
     mutate_at(vars(PR:HER2), posfun) %>%
-    drop_na() %>%
     mutate(subtype = 
                case_when(PR == "+" & ER == "+" & HER2 == "+" ~ "Basal",
                          PR == "-" & ER == "-" & HER2 == "+" ~ "HER2",
                          PR == "+" & ER == "+" & HER2 == "-" ~ "LuminalA",
                          (PR == "+" | ER == "+") & HER2 == "+" ~ "LuminalB",
                          )
-           ) %>% 
+           ) %>%
+    drop_na(subtype) %>% 
     left_join(id_T) -> brca_clin
 
 head(brca_clin)
 table(brca_clin$subtype)
-
-
-# PR = paste0("PR", PR),
-#            ER = paste0("ER", ER),
-#            HER2 = paste0("HER2", HER2)
-# 
-head(brca_clin)
 nrow(brca_clin)
-
-table(brca_clin$subtype)
 
 id_uni <- filter(id_df, !tcga_ids %in% brca_clin$tcga_ids)
 head(id_uni)
@@ -117,36 +104,45 @@ nrow(id_uni)
 table(id_uni$samps)
 ```
 
-435 tumor and 112 normal samples will be used for univariate analyses of 3213 genes.
-Rest of the dataset, 667 tumor samples, will be used for feature selection with boruta. 
+## Feature Selection
+
+566 tumor and 112 normal samples will be used for univariate analyses of 3213 genes.
+Rest of the dataset, 535 tumor samples, will be used for feature selection with *Boruta*, where response variable is the tumor subtype. 
 
 Subtype definitions:
 
 ER and PR status are assessed using the consensus of clinical tests and summarized in “breast carcinoma estrogen receptor status” and “breast carcinoma progesterone receptor status”, respectively. HER2 status is obtained from IHC in the variable labeled “lab proc her2 neu immunohistochemistry receptor status.” Samples missing data for any one of these tests are excluded from analysis, leaving a total of 638 samples with RNA-sequencing data. 
 
-Breast cancer samples are defined as 
-- “Basal” if all three markers are negative, 
-- “HER2+” if only HER2 is positive, 
-- “Luminal A” if either ER or PR are positive but not HER2, and 
-- “Luminal B” if HER2 is positive in addition to either ER or PR. 
+Breast cancer samples are defined as       
+- “Basal” if all three markers are negative,   
+- “HER2+” if only HER2 is positive,   
+- “Luminal A” if either ER or PR are positive but not HER2, and   
+- “Luminal B” if HER2 is positive in addition to either ER or PR.   
 
+### Univariate Tests
 
 ```{r}
-rna_dat_uni <- lcounts[filt_genes, id_uni$tcga_ids]
-rna_dat_uni[1:5, 1:5]
-uni_test <- function(g){
-    glm(id_uni$samps ~ g,
-        family = "binomial") %>%
-        tidy() %>%
-        .[2,] 
+
+uni_file <- "results/brca_uni.Rda"
+
+if (file.exists(uni_file)) {
+    load(uni_file)
+} else {
+    rna_dat_uni <- lcounts[filt_genes, id_uni$tcga_ids]
+    uni_test <- function(g) {
+        glm(id_uni$samps ~ g,
+            family = "binomial") %>%
+            tidy() %>%
+            .[2,]
+        }
+    rna_dat_list <- split(rna_dat_uni, rownames(rna_dat_uni))
+    uni_res <- rna_dat_list  %>%
+        map_df(uni_test) %>%
+        mutate(genes = names(rna_dat_list))
+    save(uni_res, file = uni_file)
 }
 
-rna_dat_list <- split(rna_dat_uni, rownames(rna_dat_uni))
-uni_res <- rna_dat_list  %>%
-    map_df(uni_test) %>%
-    mutate(genes=names(rna_dat_list))
 head(uni_res)
-
 hist(uni_res$p.value)
 
 uni_res %>%
@@ -155,31 +151,58 @@ uni_res %>%
 uni_res %>%
     filter(p.value < 0.05/nrow(.)) %>% .$genes -> subt_genes
 
+print(subt_genes)
+```
 
-library(Boruta)
-Boruta(x = lcounts[filt_genes, id_uni$tcga_ids], y=samps,
-       maxRuns = 500,
-       mtry = 20,
-       ntree = 100,
-       doTrace = 2
-       )
+### Boruta
 
-
-
+```{r, fig.width=16, fig.height=6}
 library(Boruta)
 
-irisE<-cbind(
-setNames(
-data.frame(apply(iris[,-5],2,sample)),
-sprintf("Nonsense%d",1:4) ),
-iris
- )
-Boruta(Species~.,data=irisE)->BorutaOnIrisE
-BorutaOnIrisE
-save(BorutaOnIrisE, file="test.RData")
-load("test.RData")
+boruta_file <- "results/brca_boruta.Rda"
+if (file.exists(boruta_file)) {
+  load(boruta_file)
+} else {
+data.frame(t(lcounts[subt_genes,])) %>%
+    rownames_to_column(var = "tcga_ids") %>% 
+    inner_join(brca_clin[, c("tcga_ids", "subtype")]) %>%
+    select(-tcga_ids) %>%
+    mutate(subtype = as.factor(subtype))-> boruta_df
+    
+    Boruta(subtype ~ ., data=boruta_df,
+       maxRuns = 1000,
+       mtry = 50,
+       ntree = 500,
+       doTrace = 1
+       ) -> brca_boruta
+    
+    save(brca_boruta,
+     file=boruta_file)
+}
 
-plot(BorutaOnIrisE)
-BorutaOnIrisE
+plot(brca_boruta, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(brca_boruta$ImpHistory),function(i) brca_boruta$ImpHistory[is.finite(brca_boruta$ImpHistory[,i]),i])
+names(lz) <- colnames(brca_boruta$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels <- str_split(names(Labels), pattern = "[.]", simplify = TRUE)[,1]
+axis(side = 1,las=2,labels = Labels, 
+     at = 1:ncol(brca_boruta$ImpHistory), cex.axis = 0.6)
+```
+
+Following are the selected features in `GENE_SYMBOL.ENTREZ_ID` format.
+
+```{r}
+cat(getSelectedAttributes(brca_boruta, withTentative = F),
+    sep="\n")
+```
+
+Table below gives the impostance of selected features.
+
+```{r}
+boruta_res <- attStats(brca_boruta)
+boruta_res %>%
+    rownames_to_column(var = "genes") %>%
+    filter(decision == "Confirmed") %>%
+    arrange(-medianImp)
 ```
 
